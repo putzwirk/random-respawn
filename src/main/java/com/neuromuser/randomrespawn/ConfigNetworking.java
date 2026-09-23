@@ -7,17 +7,7 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.Identifier;
 
 public class ConfigNetworking {
-    private static final Identifier SYNC_ID = new Identifier("random-respawn", "config");
     public static final Identifier PROGRESS_ID = new Identifier("random-respawn", "progress");
-
-    public static void init() {
-    }
-
-    public static void sendToClient(ServerPlayerEntity player) {
-        PacketByteBuf buf = PacketByteBufs.create();
-        buf.writeString(ConfigManager.toJson());
-        ServerPlayNetworking.send(player, SYNC_ID, buf);
-    }
 
     public static void sendProgress(ServerPlayerEntity player, String key, int progress) {
         PacketByteBuf buf = PacketByteBufs.create();
