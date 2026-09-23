@@ -8,7 +8,7 @@
     "Neuromuser"
   ],
   "contact": {
-    "sources": "https://github.com/neuromuser/random-respawn"
+    "sources": "https://github.com/putzwirk/random-respawn"
   },
   "license": "MIT",
   "icon": "assets/random-respawn/icon.png",
@@ -16,9 +16,12 @@
   "entrypoints": {
     "main": [
       "com.neuromuser.randomrespawn.RandomRespawn"
+    ],
+    "client": [
+      "com.neuromuser.randomrespawn.RandomRespawnClient"
     ]
   },
-  "mixins": [],
+  "accessWidener": "random-respawn.accesswidener",
   "depends": {
     "fabricloader": ">=0.16.0",
     "minecraft": "1.21.1",

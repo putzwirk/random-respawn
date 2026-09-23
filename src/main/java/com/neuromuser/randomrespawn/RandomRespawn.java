@@ -1,17 +1,22 @@
 package com.neuromuser.randomrespawn;
 
-import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.context.CommandContext;
-import net.fabricmc.api.ModInitializer;
-import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
-import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
+import net.minecraft.advancement.Advancement;
+import net.minecraft.advancement.AdvancementProgress;
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.command.argument.EntityArgumentType;
+import net.minecraft.entity.effect.StatusEffectInstance;
+import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.server.command.CommandManager;
@@ -24,152 +29,362 @@ import net.minecraft.util.WorldSavePath;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.Heightmap;
-import net.minecraft.world.chunk.WorldChunk;
+import net.minecraft.world.chunk.ChunkStatus;
 
 import java.nio.file.Path;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class RandomRespawn implements ModInitializer {
+    private static final int MAX_SEARCH_ITERATIONS = 50;
+    private static final int CANDIDATE_TIMEOUT_TICKS = 100;
+    private static final int LOADING_TIMEOUT_TICKS = 400;
+    private static final int MIN_LOADING_TICKS = 30;
+    private static final int POST_TELEPORT_TICKS = 60;
+    private static final Set<Block> HAZARDOUS_BLOCKS = Set.of(
+            Blocks.MAGMA_BLOCK,
+            Blocks.CACTUS,
+            Blocks.CAMPFIRE,
+            Blocks.SOUL_CAMPFIRE,
+            Blocks.POWDER_SNOW,
+            Blocks.SWEET_BERRY_BUSH,
+            Blocks.WITHER_ROSE,
+            Blocks.POINTED_DRIPSTONE
+    );
+
     private static Path configPath;
-    private final Map<UUID, BlockPos> pendingRespawns = new HashMap<>();
+    private final Map<UUID, Integer> playerRetryCount = new ConcurrentHashMap<>();
+    private final Map<UUID, RespawnSession> sessions = new ConcurrentHashMap<>();
+
+    private enum Phase {
+        SEARCHING,
+        LOADING,
+        TELEPORTED
+    }
+
+    private static final class RespawnSession {
+        final ServerWorld world;
+        Phase phase = Phase.SEARCHING;
+        ChunkPos candidate;
+        int candidateTicks;
+        int searchIteration;
+        BlockPos targetPos;
+        final Set<ChunkPos> chunksToLoad = new HashSet<>();
+        final Set<ChunkPos> loadedChunks = new HashSet<>();
+        int phaseTicks;
+
+        RespawnSession(ServerWorld world) {
+            this.world = world;
+        }
+
+        void setTarget(BlockPos pos) {
+            this.targetPos = pos;
+            this.phase = Phase.LOADING;
+            this.phaseTicks = 0;
+            ChunkPos center = new ChunkPos(pos);
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    chunksToLoad.add(new ChunkPos(center.x + dx, center.z + dz));
+                }
+            }
+        }
+    }
 
     @Override
     public void onInitialize() {
         ConfigNetworking.init();
 
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
-            Path worldConfigPath = server.getSavePath(WorldSavePath.ROOT)
-                    .resolve("randomrespawn.json");
+            Path worldConfigPath = server.getSavePath(WorldSavePath.ROOT).resolve("randomrespawn.json");
             ConfigManager.load(worldConfigPath);
             configPath = worldConfigPath;
         });
 
-        ServerLivingEntityEvents.ALLOW_DEATH.register((entity, damageSource, damageAmount) -> {
-            if (entity instanceof ServerPlayerEntity player) {
-                Config config = ConfigManager.get();
-                boolean enabled = config.playerSettings.getOrDefault(
-                        player.getUuidAsString(),
-                        config.defaultEnabled
-                );
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            if (sessions.isEmpty()) return;
 
-                if (enabled) {
-                    ServerWorld world = player.getServerWorld();
-                    UUID playerUuid = player.getUuid();
-                    int playerId = player.getId();
+            Iterator<Map.Entry<UUID, RespawnSession>> it = sessions.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<UUID, RespawnSession> entry = it.next();
+                UUID uuid = entry.getKey();
+                RespawnSession session = entry.getValue();
 
-                    world.getServer().execute(() -> findAndPreloadRespawnLocation(world, playerUuid, playerId));
+                ServerPlayerEntity player = server.getPlayerManager().getPlayer(uuid);
+                if (player == null || player.isRemoved()) {
+                    it.remove();
+                    continue;
+                }
+
+                try {
+                    session.phaseTicks++;
+                    boolean done = switch (session.phase) {
+                        case SEARCHING -> tickSearching(uuid, session, player);
+                        case LOADING -> tickLoading(uuid, session, player);
+                        case TELEPORTED -> tickTeleported(session, player);
+                    };
+                    if (done) {
+                        it.remove();
+                    }
+                } catch (Exception e) {
+                    System.err.println("Random respawn failed for " + uuid + ": " + e);
+                    finishSession(player);
+                    it.remove();
                 }
             }
-            return true; 
         });
 
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
             ServerPlayerEntity player = handler.player;
-            ConfigNetworking.sendToClient(player);
             String uuidStr = player.getUuidAsString();
-            if (!ConfigManager.get().playerSettings.containsKey(uuidStr)) {
-                teleportPlayer(player);
-                ConfigManager.get().playerSettings.put(uuidStr, ConfigManager.get().defaultEnabled);
+            Config config = ConfigManager.get();
+
+            if (config.pendingRespawns.contains(uuidStr)) {
+                removeInvulnerability(player);
+            }
+
+            if (!config.playerSettings.containsKey(uuidStr)) {
+                config.playerSettings.put(uuidStr, config.defaultEnabled);
                 if (configPath != null) {
                     ConfigManager.save(configPath);
+                }
+                if (config.defaultEnabled) {
+                    startSession(player.getServerWorld(), player);
                 }
             }
         });
 
         ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
-            if (!alive) {
-                UUID uuid = newPlayer.getUuid();
-                BlockPos respawnPos = pendingRespawns.remove(uuid);
+            if (alive) return;
 
-                if (respawnPos != null) {
-                    teleportToPreloaded(newPlayer, respawnPos);
-                } else {
-                    teleportPlayer(newPlayer);
-                }
+            Config config = ConfigManager.get();
+            boolean enabled = config.playerSettings.getOrDefault(
+                    newPlayer.getUuidAsString(),
+                    config.defaultEnabled
+            );
+            if (!enabled) return;
+
+            ServerWorld world = newPlayer.getServerWorld();
+            if (config.setDayTimeOnPlayerDeath) {
+                world.setTimeOfDay(1000L);
             }
+            resetPlayerProgress(newPlayer);
+            startSession(world, newPlayer);
         });
 
-        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> pendingRespawns.remove(handler.player.getUuid()));
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+            UUID uuid = handler.player.getUuid();
+            playerRetryCount.remove(uuid);
+            sessions.remove(uuid);
+            if (ConfigManager.get().pendingRespawns.contains(handler.player.getUuidAsString())) {
+                removeInvulnerability(handler.player);
+            }
+        });
 
         registerCommands();
     }
 
-    private void findAndPreloadRespawnLocation(ServerWorld world, UUID playerUuid, int playerId) {
-        searchNextValidPosition(world, playerUuid, playerId, 0);
-    }
-
-    private void searchNextValidPosition(ServerWorld world, UUID playerUuid, int playerId, int iteration) {
-        if (iteration > 5000) {
-            System.err.println("RandomRespawn: Failed to find unvisited chunk after 5000 attempts for player " + playerUuid);
-            return;
+    private boolean tickSearching(UUID uuid, RespawnSession session, ServerPlayerEntity player) {
+        if (session.candidate == null) {
+            if (session.searchIteration > MAX_SEARCH_ITERATIONS) {
+                finishSession(player);
+                return true;
+            }
+            session.candidate = nextCandidate(session.searchIteration++);
+            session.candidateTicks = 0;
+            return false;
         }
 
-        for (int i = 0; i < 10 && iteration + i <= 5000; i++) {
-            int currentIteration = iteration + i;
-            int rangeExpansion = (currentIteration / 10) * 100;
-            double rx = getRandomCoordinate(rangeExpansion);
-            double rz = getRandomCoordinate(rangeExpansion);
+        ChunkPos cp = session.candidate;
+        session.world.getChunkManager().addTicket(ChunkTicketType.POST_TELEPORT, cp, 0, player.getId());
 
-            int ix = (int) Math.floor(rx);
-            int iz = (int) Math.floor(rz);
-            int chunkX = ix >> 4;
-            int chunkZ = iz >> 4;
-
-            WorldChunk chunk = world.getChunk(chunkX, chunkZ);
-
+        var chunk = session.world.getChunk(cp.x, cp.z, ChunkStatus.FULL, false);
+        if (chunk != null) {
             if (chunk.getInhabitedTime() > 0) {
-                continue; 
+                session.candidate = null;
+                return false;
             }
 
-            int y = getSafeSurfaceY(world, ix, iz);
-            if (y <= world.getBottomY()) {
-                continue; 
+            BlockPos spawnPos = findSurfaceSpawn(session.world, cp);
+            if (spawnPos != null) {
+                session.setTarget(spawnPos);
+                ConfigNetworking.sendProgress(player, "randomrespawn.generating", 0);
+            } else {
+                session.candidate = null;
             }
-
-            BlockPos pos = new BlockPos(ix, y, iz);
-            pendingRespawns.put(playerUuid, pos);
-
-            ChunkPos chunkPos = new ChunkPos(pos);
-            world.getChunkManager().addTicket(
-                    ChunkTicketType.POST_TELEPORT,
-                    chunkPos,
-                    3,
-                    playerId
-            );
-            return; 
+        } else if (++session.candidateTicks > CANDIDATE_TIMEOUT_TICKS) {
+            session.candidate = null;
         }
 
-        world.getServer().execute(() ->
-                searchNextValidPosition(world, playerUuid, playerId, iteration + 10)
-        );
+        return false;
     }
 
-    private void teleportToPreloaded(ServerPlayerEntity player, BlockPos pos) {
-        ServerWorld world = player.getServerWorld();
-        player.teleport(world, pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5,
-                player.getYaw(), player.getPitch());
-        player.setVelocity(0, 0, 0);
-        player.fallDistance = 0;
+    private ChunkPos nextCandidate(int iteration) {
+        int rangeExpansion = (iteration / 5) * 200;
+        double rx = getRandomCoordinate(rangeExpansion);
+        double rz = getRandomCoordinate(rangeExpansion);
+        return new ChunkPos(((int) Math.floor(rx)) >> 4, ((int) Math.floor(rz)) >> 4);
+    }
+
+    private boolean tickLoading(UUID uuid, RespawnSession session, ServerPlayerEntity player) {
+        for (ChunkPos cp : session.chunksToLoad) {
+            session.world.getChunkManager().addTicket(ChunkTicketType.POST_TELEPORT, cp, 0, player.getId());
+            if (session.world.getChunk(cp.x, cp.z, ChunkStatus.FULL, false) != null) {
+                session.loadedChunks.add(cp);
+            }
+        }
+
+        int actualProgress = (int) ((session.loadedChunks.size() / (float) session.chunksToLoad.size()) * 100);
+        int displayProgress = Math.min(actualProgress, Math.min(95, session.phaseTicks * 3));
+        ConfigNetworking.sendProgress(player, "randomrespawn.generating", displayProgress);
+
+        if (session.loadedChunks.size() >= session.chunksToLoad.size() && session.phaseTicks >= MIN_LOADING_TICKS) {
+            player.teleport(session.world, session.targetPos.getX() + 0.5, session.targetPos.getY(), session.targetPos.getZ() + 0.5,
+                    player.getYaw(), player.getPitch());
+            player.setVelocity(0, 0, 0);
+            player.fallDistance = 0;
+            session.phase = Phase.TELEPORTED;
+            session.phaseTicks = 0;
+            return false;
+        }
+
+        if (session.phaseTicks > LOADING_TIMEOUT_TICKS) {
+            playerRetryCount.merge(uuid, 1, Integer::sum);
+            removeInvulnerability(player);
+            ConfigNetworking.sendProgress(player, "randomrespawn.searching", 0);
+            player.getServer().execute(() -> startSession(player.getServerWorld(), player));
+            return true;
+        }
+
+        return false;
+    }
+
+    private boolean tickTeleported(RespawnSession session, ServerPlayerEntity player) {
+        int finalProgress = Math.min(99, 95 + (session.phaseTicks / 8));
+        ConfigNetworking.sendProgress(player, "randomrespawn.generating", finalProgress);
+
+        if (session.phaseTicks >= POST_TELEPORT_TICKS) {
+            finishSession(player);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void finishSession(ServerPlayerEntity player) {
+        removeInvulnerability(player);
+        playerRetryCount.remove(player.getUuid());
+        ConfigNetworking.sendProgress(player, "randomrespawn.ready", 100);
+    }
+
+    private void startSession(ServerWorld world, ServerPlayerEntity player) {
+        UUID uuid = player.getUuid();
+        makePlayerInvulnerable(player);
+        ConfigNetworking.sendProgress(player, "randomrespawn.searching", 0);
+        RespawnSession session = new RespawnSession(world);
+        session.searchIteration = playerRetryCount.getOrDefault(uuid, 0);
+        sessions.put(uuid, session);
+    }
+
+    private void makePlayerInvulnerable(ServerPlayerEntity player) {
+        player.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, 999999, 4, false, false));
+        player.addStatusEffect(new StatusEffectInstance(StatusEffects.FIRE_RESISTANCE, 999999, 0, false, false));
+        player.addStatusEffect(new StatusEffectInstance(StatusEffects.WATER_BREATHING, 999999, 0, false, false));
+        player.setInvulnerable(true);
+        if (ConfigManager.get().pendingRespawns.add(player.getUuidAsString()) && configPath != null) {
+            ConfigManager.save(configPath);
+        }
+    }
+
+    private void removeInvulnerability(ServerPlayerEntity player) {
+        player.removeStatusEffect(StatusEffects.RESISTANCE);
+        player.removeStatusEffect(StatusEffects.FIRE_RESISTANCE);
+        player.removeStatusEffect(StatusEffects.WATER_BREATHING);
+        player.setInvulnerable(false);
+        if (ConfigManager.get().pendingRespawns.remove(player.getUuidAsString()) && configPath != null) {
+            ConfigManager.save(configPath);
+        }
+    }
+
+    private void resetPlayerProgress(ServerPlayerEntity player) {
+        player.setExperienceLevel(0);
+        player.setExperiencePoints(0);
+
+        if (player.getServer() == null) return;
+
+        var playerAdvancements = player.getAdvancementTracker();
+        for (Map.Entry<Advancement, AdvancementProgress> entry : new ArrayList<>(playerAdvancements.progress.entrySet())) {
+            Advancement advancement = entry.getKey();
+            AdvancementProgress progress = entry.getValue();
+
+            if (progress.isAnyObtained()) {
+                for (String criterion : progress.getObtainedCriteria()) {
+                    playerAdvancements.revokeCriterion(advancement, criterion);
+                }
+            }
+        }
+    }
+
+    private BlockPos findSurfaceSpawn(ServerWorld world, ChunkPos cp) {
+        int baseX = cp.getStartX();
+        int baseZ = cp.getStartZ();
+
+        int[][] checkOffsets = {
+                {8, 8}, {4, 4}, {12, 4}, {4, 12}, {12, 12},
+                {8, 4}, {4, 8}, {12, 8}, {8, 12},
+                {6, 6}, {10, 10}, {6, 10}, {10, 6}
+        };
+
+        for (int[] offset : checkOffsets) {
+            int x = baseX + offset[0];
+            int z = baseZ + offset[1];
+
+            int surfaceY = world.getTopY(Heightmap.Type.WORLD_SURFACE, x, z);
+            if (surfaceY <= world.getBottomY()) continue;
+
+            BlockPos checkPos = new BlockPos(x, surfaceY, z);
+
+            if (!world.isSkyVisible(checkPos)) continue;
+
+            BlockPos groundPos = checkPos.down();
+            BlockState ground = world.getBlockState(groundPos);
+            BlockState feet = world.getBlockState(checkPos);
+            BlockState head = world.getBlockState(checkPos.up());
+
+            if (!ground.isSolidBlock(world, groundPos)) continue;
+            if (isHazardous(ground)) continue;
+            if (!feet.isAir() || !head.isAir()) continue;
+
+            return checkPos;
+        }
+
+        return null;
     }
 
     private void registerCommands() {
-        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> dispatcher.register(CommandManager.literal("randomrespawn")
-                .requires(source -> source.hasPermissionLevel(2))
-                .then(CommandManager.literal("set")
-                        .then(CommandManager.argument("player", EntityArgumentType.player())
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
+                dispatcher.register(CommandManager.literal("randomrespawn")
+                        .requires(source -> source.hasPermissionLevel(2))
+                        .then(CommandManager.literal("set")
+                                .then(CommandManager.argument("player", EntityArgumentType.player())
+                                        .then(CommandManager.argument("enabled", BoolArgumentType.bool())
+                                                .executes(this::setPlayerSetting))))
+                        .then(CommandManager.literal("default")
                                 .then(CommandManager.argument("enabled", BoolArgumentType.bool())
-                                        .executes(this::setPlayerSetting))))
-                .then(CommandManager.literal("default")
-                        .then(CommandManager.argument("enabled", BoolArgumentType.bool())
-                                .executes(this::setDefaultSetting)))
-                .then(CommandManager.literal("range")
-                        .then(CommandManager.argument("distance", IntegerArgumentType.integer(100, 1000000))
-                                .executes(this::setRange)))
-                .then(CommandManager.literal("info")
-                        .executes(this::showInfo))
-        ));
+                                        .executes(this::setDefaultSetting)))
+                        .then(CommandManager.literal("range")
+                                .then(CommandManager.argument("distance", IntegerArgumentType.integer(100, 1000000))
+                                        .executes(this::setRange)))
+                        .then(CommandManager.literal("setDayTimeOnPlayerDeath")
+                                .then(CommandManager.argument("enabled", BoolArgumentType.bool())
+                                        .executes(this::setDayTimeOnPlayerDeath)))
+                        .then(CommandManager.literal("info")
+                                .executes(this::showInfo))
+                ));
     }
 
     private int setPlayerSetting(CommandContext<ServerCommandSource> context) {
@@ -182,7 +397,8 @@ public class RandomRespawn implements ModInitializer {
                 ConfigManager.save(configPath);
             }
 
-            context.getSource().sendFeedback(() -> Text.literal("Random respawn for " + targetPlayer.getName().getString() + " is now " + (enabled ? "enabled" : "disabled")), true);
+            context.getSource().sendFeedback(() -> Text.literal("Random respawn for " +
+                    targetPlayer.getName().getString() + " is now " + (enabled ? "enabled" : "disabled")), true);
             return 1;
         } catch (Exception e) {
             context.getSource().sendError(Text.literal("Error: " + e.getMessage()));
@@ -196,7 +412,8 @@ public class RandomRespawn implements ModInitializer {
             ConfigManager.save(configPath);
         }
 
-        context.getSource().sendFeedback(() -> Text.literal("Default random respawn is now " + (ConfigManager.get().defaultEnabled ? "enabled" : "disabled")), true);
+        context.getSource().sendFeedback(() -> Text.literal("Default random respawn is now " +
+                (ConfigManager.get().defaultEnabled ? "enabled" : "disabled")), true);
         return 1;
     }
 
@@ -206,58 +423,31 @@ public class RandomRespawn implements ModInitializer {
             ConfigManager.save(configPath);
         }
 
-        context.getSource().sendFeedback(() -> Text.literal("Range set to " + ConfigManager.get().respawnRange), true);
+        context.getSource().sendFeedback(() -> Text.literal("Range set to " +
+                ConfigManager.get().respawnRange), true);
+        return 1;
+    }
+
+    private int setDayTimeOnPlayerDeath(CommandContext<ServerCommandSource> context) {
+        ConfigManager.get().setDayTimeOnPlayerDeath = BoolArgumentType.getBool(context, "enabled");
+        if (configPath != null) {
+            ConfigManager.save(configPath);
+        }
+
+        context.getSource().sendFeedback(() -> Text.literal("Set day time on player death is now " +
+                (ConfigManager.get().setDayTimeOnPlayerDeath ? "enabled" : "disabled")), true);
         return 1;
     }
 
     private int showInfo(CommandContext<ServerCommandSource> context) {
         Config config = ConfigManager.get();
-        context.getSource().sendFeedback(() -> Text.literal("=== Random Respawn Settings ===\n" + "Default: " + config.defaultEnabled + "\n" + "Range: " + config.respawnRange + "\n" + "Tracked Players: " + config.playerSettings.size()), false);
+        context.getSource().sendFeedback(() -> Text.literal(
+                "=== Random Respawn Settings ===\n" +
+                        "Default: " + config.defaultEnabled + "\n" +
+                        "Range: " + config.respawnRange + "\n" +
+                        "Set day time on death: " + config.setDayTimeOnPlayerDeath + "\n" +
+                        "Tracked Players: " + config.playerSettings.size()), false);
         return 1;
-    }
-
-    private void teleportPlayer(ServerPlayerEntity player) {
-        Config config = ConfigManager.get();
-        boolean enabled = config.playerSettings.getOrDefault(player.getUuidAsString(), config.defaultEnabled);
-
-        if (!enabled) return;
-
-        tryToTeleport(player, 0);
-    }
-
-    private void tryToTeleport(ServerPlayerEntity player, int iteration) {
-        if (iteration > 1000) {
-            System.err.println("RandomRespawn: Failed to find unvisited chunk for first join after 1000 attempts");
-            return;
-        }
-
-        ServerWorld world = player.getServerWorld();
-
-        int rangeExpansion = (iteration / 10) * 100;
-        double rx = getRandomCoordinate(rangeExpansion);
-        double rz = getRandomCoordinate(rangeExpansion);
-
-        int ix = (int) Math.floor(rx);
-        int iz = (int) Math.floor(rz);
-        int chunkX = ix >> 4;
-        int chunkZ = iz >> 4;
-
-        WorldChunk chunk = world.getChunk(chunkX, chunkZ);
-
-        if (chunk.getInhabitedTime() > 0) {
-            tryToTeleport(player, iteration + 1);
-            return;
-        }
-
-        int y = getSafeSurfaceY(world, ix, iz);
-        if (y <= world.getBottomY()) {
-            tryToTeleport(player, iteration + 1);
-            return;
-        }
-
-        player.teleport(world, ix + 0.5, y, iz + 0.5, player.getYaw(), player.getPitch());
-        player.setVelocity(0, 0, 0);
-        player.fallDistance = 0;
     }
 
     public double getRandomCoordinate(int rangeExpansion) {
@@ -265,27 +455,9 @@ public class RandomRespawn implements ModInitializer {
         return (Math.random() * (range * 2)) - range;
     }
 
-    private int getSafeSurfaceY(ServerWorld world, int x, int z) {
-        int surface = world.getTopY(Heightmap.Type.MOTION_BLOCKING, x, z);
-        if (surface <= world.getBottomY()) return world.getBottomY() - 1;
-
-        BlockPos pos = new BlockPos(x, surface, z);
-        BlockState ground = world.getBlockState(pos.down());
-        BlockState feet = world.getBlockState(pos);
-        BlockState head = world.getBlockState(pos.up());
-
-        if (isHazardous(ground) || isBlocked(feet, world, pos) || isBlocked(head, world, pos.up())) {
-            return world.getBottomY() - 1;
-        }
-        return surface;
-    }
-
-    private boolean isBlocked(BlockState state, ServerWorld world, BlockPos pos) {
-        return !state.isAir() && (!state.getFluidState().isEmpty() || !state.getCollisionShape(world, pos).isEmpty());
-    }
-
     private boolean isHazardous(BlockState state) {
-        return state.getFluidState().isIn(FluidTags.LAVA) || state.isIn(BlockTags.FIRE) ||
-                state.isOf(Blocks.MAGMA_BLOCK) || state.isOf(Blocks.CACTUS) || state.isOf(Blocks.POWDER_SNOW);
+        return state.getFluidState().isIn(FluidTags.LAVA)
+                || state.isIn(BlockTags.FIRE)
+                || HAZARDOUS_BLOCKS.contains(state.getBlock());
     }
 }

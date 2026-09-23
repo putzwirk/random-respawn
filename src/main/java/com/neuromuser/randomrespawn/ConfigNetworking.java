@@ -9,15 +9,18 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.Identifier;
 
 public class ConfigNetworking {
-    public record ConfigPayload(String json) implements CustomPayload {
-        public static final CustomPayload.Id<ConfigPayload> ID =
-            new CustomPayload.Id<>(Identifier.of("random-respawn", "config"));
+    public record ProgressPayload(String key, int progress) implements CustomPayload {
+        public static final CustomPayload.Id<ProgressPayload> ID =
+                new CustomPayload.Id<>(Identifier.of("random-respawn", "progress"));
 
-        public static final PacketCodec<RegistryByteBuf, ConfigPayload> CODEC =
-            PacketCodec.of(
-                (value, buf) -> buf.writeString(value.json),
-                buf -> new ConfigPayload(buf.readString())
-            );
+        public static final PacketCodec<RegistryByteBuf, ProgressPayload> CODEC =
+                PacketCodec.of(
+                        (value, buf) -> {
+                            buf.writeString(value.key);
+                            buf.writeInt(value.progress);
+                        },
+                        buf -> new ProgressPayload(buf.readString(), buf.readInt())
+                );
 
         @Override
         public CustomPayload.Id<? extends CustomPayload> getId() {
@@ -26,11 +29,10 @@ public class ConfigNetworking {
     }
 
     public static void init() {
-        PayloadTypeRegistry.playS2C().register(ConfigPayload.ID, ConfigPayload.CODEC);
-
+        PayloadTypeRegistry.playS2C().register(ProgressPayload.ID, ProgressPayload.CODEC);
     }
 
-    public static void sendToClient(ServerPlayerEntity player) {
-        ServerPlayNetworking.send(player, new ConfigPayload(ConfigManager.toJson()));
+    public static void sendProgress(ServerPlayerEntity player, String key, int progress) {
+        ServerPlayNetworking.send(player, new ProgressPayload(key, progress));
     }
 }
