@@ -3,8 +3,11 @@ package com.neuromuser.randomrespawn;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
 
 public class RespawnLoadingScreen extends Screen {
+    private static final Identifier DIRT_BACKGROUND = Identifier.of("minecraft", "textures/block/dirt.png");
+
     private String currentKey = "randomrespawn.please_wait";
     private int progress = 0;
     private int ticksOpen = 0;
@@ -42,7 +45,9 @@ public class RespawnLoadingScreen extends Screen {
 
     @Override
     public void renderBackground(DrawContext context, int mouseX, int mouseY, float delta) {
-        renderBackgroundTexture(context, MENU_BACKGROUND_TEXTURE, 0, 0, 0.0F, 0.0F, this.width, this.height);
+        context.setShaderColor(0.25F, 0.25F, 0.25F, 1.0F);
+        renderBackgroundTexture(context, DIRT_BACKGROUND, 0, 0, 0.0F, 0.0F, this.width, this.height);
+        context.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
     }
 
     @Override
