@@ -34,10 +34,12 @@ public class RespawnLoadingScreen extends Screen {
 
     @Override
     public void render(MatrixStack matrices, int mouseX, int mouseY, float delta) {
-        super.render(matrices, mouseX, mouseY, delta);
+        this.renderBackgroundTexture(0);
 
         Text statusText = Text.translatable(currentKey, progress);
         drawCenteredTextWithShadow(matrices, this.textRenderer, statusText.asOrderedText(), this.width / 2, this.height / 2, 0xFFFFFF);
+
+        super.render(matrices, mouseX, mouseY, delta);
     }
 
     @Override
