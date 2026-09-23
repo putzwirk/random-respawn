@@ -41,6 +41,11 @@ public class RespawnLoadingScreen extends Screen {
     }
 
     @Override
+    public void renderBackground(DrawContext context, int mouseX, int mouseY, float delta) {
+        renderBackgroundTexture(context, MENU_BACKGROUND_TEXTURE, 0, 0, 0.0F, 0.0F, this.width, this.height);
+    }
+
+    @Override
     public boolean shouldCloseOnEsc() {
         return false;
     }
