@@ -9,7 +9,7 @@ import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.context.CommandContext;
-import net.minecraft.advancement.Advancement;
+import net.minecraft.advancement.AdvancementEntry;
 import net.minecraft.advancement.AdvancementProgress;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
@@ -317,8 +317,8 @@ public class RandomRespawn implements ModInitializer {
         if (player.getServer() == null) return;
 
         var playerAdvancements = player.getAdvancementTracker();
-        for (Map.Entry<Advancement, AdvancementProgress> entry : new ArrayList<>(playerAdvancements.progress.entrySet())) {
-            Advancement advancement = entry.getKey();
+        for (Map.Entry<AdvancementEntry, AdvancementProgress> entry : new ArrayList<>(playerAdvancements.progress.entrySet())) {
+            AdvancementEntry advancement = entry.getKey();
             AdvancementProgress progress = entry.getValue();
 
             if (progress.isAnyObtained()) {
